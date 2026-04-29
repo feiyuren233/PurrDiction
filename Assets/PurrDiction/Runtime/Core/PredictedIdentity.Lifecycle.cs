@@ -55,20 +55,20 @@ namespace PurrNet.Prediction
             ResetInterpolation();
         }
 
-        internal bool RunWriteCurrentState(PlayerID receiver, BitPacker packer, DeltaModule deltaModule)
+        internal bool RunWriteCurrentState(PlayerID receiver, BitPacker packer, DeltaModule deltaModule, bool reliable)
         {
             bool moduleSetChanged = WriteDynamicModuleSnapshot(receiver, packer, deltaModule);
-            bool modulesChanged = WriteModules(receiver, packer, deltaModule);
-            bool identityChanged = WriteCurrentState(receiver, packer, deltaModule);
+            bool modulesChanged = WriteModules(receiver, packer, deltaModule, reliable);
+            bool identityChanged = WriteCurrentState(receiver, packer, deltaModule, reliable);
 
             return moduleSetChanged || modulesChanged || identityChanged;
         }
 
-        internal void RunReadState(ulong tick, BitPacker packer, DeltaModule deltaModule)
+        internal void RunReadState(ulong tick, BitPacker packer, DeltaModule deltaModule, bool reliable)
         {
             ReadDynamicModuleSnapshot(tick, packer, deltaModule);
-            ReadModules(tick, packer, deltaModule);
-            ReadState(tick, packer, deltaModule);
+            ReadModules(tick, packer, deltaModule, reliable);
+            ReadState(tick, packer, deltaModule, reliable);
         }
 
         internal void RunWriteFirstState(ulong tick, BitPacker packer)
