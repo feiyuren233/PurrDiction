@@ -11,55 +11,6 @@ namespace PurrNet.Prediction
 {
     public abstract class PredictedIdentity<STATE> : PredictedIdentity where STATE : struct, IPredictedData<STATE>
     {
-        protected readonly struct DeltaKey<T, S> : IStableHashable
-        {
-            private readonly PredictedComponentID id;
-            private readonly SceneID scene;
-
-            public DeltaKey(SceneID scene, PredictedComponentID id)
-            {
-                this.id = id;
-                this.scene = scene;
-            }
-
-            public uint GetStableHash()
-            {
-                const uint Off = 2166136261u;
-                const uint Pri = 16777619u;
-                uint h = Off;
-                h = (h ^ Hasher<T>.stableHash) * Pri;
-                h = (h ^ Hasher<S>.stableHash) * Pri;
-                h = (h ^ id.componentId.value) * Pri;
-                h = (h ^ id.objectId.instanceId.value) * Pri;
-                h = (h ^ scene.id.value) * Pri;
-                return h;
-            }
-        }
-
-        protected readonly struct DeltaKey<T> : IStableHashable
-        {
-            private readonly PredictedComponentID id;
-            private readonly SceneID scene;
-
-            public DeltaKey(SceneID scene, PredictedComponentID id)
-            {
-                this.id = id;
-                this.scene = scene;
-            }
-
-            public uint GetStableHash()
-            {
-                const uint Off = 2166136261u;
-                const uint Pri = 16777619u;
-                uint h = Off;
-                h = (h ^ Hasher<T>.stableHash) * Pri;
-                h = (h ^ id.componentId.value) * Pri;
-                h = (h ^ id.objectId.instanceId.value) * Pri;
-                h = (h ^ scene.id.value) * Pri;
-                return h;
-            }
-        }
-
         public PredictedHierarchy hierarchy { get; private set; }
 
         public override string ToString()
@@ -265,55 +216,75 @@ namespace PurrNet.Prediction
             });
         }
 
-        internal override bool WriteCurrentState(PlayerID target, BitPacker packer, DeltaModule deltaModule)
+        internal override bool WriteCurrentState(PlayerID target, BitPacker packer, DeltaModule deltaModule, bool reliable)
         {
             int pos = packer.positionInBits;
-            int flagPos = packer.AdvanceBits(1);
+            bool changed;
 
-            bool changed = deltaModule.WriteReliable(packer, target, internalKey, fullPredictedState.prediction);
-            changed = WriteDeltaState(target, packer, deltaModule) || changed;
-
-            packer.WriteAt(flagPos, changed);
-            if (!changed)
-                packer.SetBitPosition(flagPos + 1);
+            if (reliable)
+            {
+                int flagPos = packer.AdvanceBits(1);
+                changed = deltaModule.WriteReliable(packer, target, internalKey, fullPredictedState.prediction);
+                changed = WriteDeltaState(target, packer, deltaModule, reliable) || changed;
+                packer.WriteAt(flagPos, changed);
+                if (!changed)
+                    packer.SetBitPosition(flagPos + 1);
+            }
+            else
+            {
+                bool pChanged = deltaModule.Write(packer, target, internalKey, fullPredictedState.prediction);
+                bool sChanged = WriteDeltaState(target, packer, deltaModule, reliable);
+                changed = pChanged || sChanged;
+            }
 
             TickBandwidthProfiler.OnWroteState(myType, packer.positionInBits - pos, this);
             return changed;
         }
 
-        protected virtual bool WriteDeltaState(PlayerID target, BitPacker packer, DeltaModule deltaModule)
+        protected virtual bool WriteDeltaState(PlayerID target, BitPacker packer, DeltaModule deltaModule, bool reliable)
         {
-            return deltaModule.WriteReliable(packer, target, stateKey, fullPredictedState.state);
+            return reliable
+                ? deltaModule.WriteReliable(packer, target, stateKey, fullPredictedState.state)
+                : deltaModule.Write(packer, target, stateKey, fullPredictedState.state);
         }
 
         [UsedImplicitly]
-        internal override void ReadState(ulong tick, BitPacker packer, DeltaModule deltaModule)
+        internal override void ReadState(ulong tick, BitPacker packer, DeltaModule deltaModule, bool reliable)
         {
             int pos = packer.positionInBits;
-
-            bool changed = Packer<bool>.Read(packer);
             FULL_STATE<STATE> newState = default;
 
-            if (changed)
+            if (reliable)
             {
-                deltaModule.ReadReliable(packer, internalKey, ref newState.prediction);
+                bool changed = Packer<bool>.Read(packer);
+                if (changed)
+                {
+                    deltaModule.ReadReliable(packer, internalKey, ref newState.prediction);
+                }
+                else
+                {
+                    packer.SetBitPosition(pos);
+                    deltaModule.ReadReliable(packer, internalKey, ref newState.prediction);
+                    packer.SetBitPosition(pos);
+                }
             }
             else
             {
-                packer.SetBitPosition(pos);
-                deltaModule.ReadReliable(packer, internalKey, ref newState.prediction);
-                packer.SetBitPosition(pos);
+                deltaModule.Read(packer, internalKey, default, ref newState.prediction);
             }
 
-            ReadDeltaState(packer, deltaModule, ref newState.state);
+            ReadDeltaState(packer, deltaModule, reliable, ref newState.state);
 
             _stateHistory.Write(tick, newState);
             TickBandwidthProfiler.OnReadState(myType, packer.positionInBits - pos, this);
         }
 
-        protected virtual void ReadDeltaState(BitPacker packer, DeltaModule deltaModule, ref STATE state)
+        protected virtual void ReadDeltaState(BitPacker packer, DeltaModule deltaModule, bool reliable, ref STATE state)
         {
-            deltaModule.ReadReliable(packer, stateKey, ref state);
+            if (reliable)
+                deltaModule.ReadReliable(packer, stateKey, ref state);
+            else
+                deltaModule.Read(packer, stateKey, default, ref state);
         }
 
         internal override void WriteInput(ulong localTick, PlayerID receiver, BitPacker input, DeltaModule deltaModule, bool reliable) { }

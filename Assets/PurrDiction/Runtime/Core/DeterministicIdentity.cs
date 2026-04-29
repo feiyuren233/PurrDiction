@@ -2,20 +2,38 @@
 using PurrNet.Logging;
 using PurrNet.Modules;
 using PurrNet.Packing;
+using PurrNet.Prediction.Profiler;
 using UnityEngine;
 
 namespace PurrNet.Prediction
 {
     public abstract class DeterministicIdentity<STATE> : PredictedIdentity where STATE : struct, IPredictedData<STATE>
     {
-        public override bool isDeterministic => true;
+        public override bool isDeterministic => !syncData;
+
+        bool syncData =>
+            predictionManager &&
+            predictionManager.frameChannelMode == FrameChannelMode.Unreliable &&
+            predictionManager.syncDeterministicData;
+
+        protected DeltaKey<STATE> stateKey => new(sceneId, id);
+        DeltaKey<PredictedIdentityState, STATE> internalKey => new(sceneId, id);
 
         protected virtual void Simulate(ref STATE state, sfloat delta) { }
 
         protected virtual void LateSimulate(ref STATE state, sfloat delta) { }
 
-        internal override bool WriteCurrentState(PlayerID target, BitPacker packer, DeltaModule deltaModule)
+        internal override bool WriteCurrentState(PlayerID target, BitPacker packer, DeltaModule deltaModule, bool reliable)
         {
+            if (syncData)
+            {
+                int pos = packer.positionInBits;
+                bool pChanged = deltaModule.Write(packer, target, internalKey, fullPredictedState.prediction);
+                bool sChanged = deltaModule.Write(packer, target, stateKey, fullPredictedState.state);
+                TickBandwidthProfiler.OnWroteState(myType, packer.positionInBits - pos, this);
+                return pChanged || sChanged;
+            }
+
             if (predictionManager.validateDeterministicData)
             {
                 Packer<bool>.Write(packer, true);
@@ -26,8 +44,19 @@ namespace PurrNet.Prediction
             return false;
         }
 
-        internal override void ReadState(ulong tick, BitPacker packer, DeltaModule deltaModule)
+        internal override void ReadState(ulong tick, BitPacker packer, DeltaModule deltaModule, bool reliable)
         {
+            if (syncData)
+            {
+                int pos = packer.positionInBits;
+                FULL_STATE<STATE> newState = default;
+                deltaModule.Read(packer, internalKey, default, ref newState.prediction);
+                deltaModule.Read(packer, stateKey, default, ref newState.state);
+                _stateHistory.Write(tick, newState);
+                TickBandwidthProfiler.OnReadState(myType, packer.positionInBits - pos, this);
+                return;
+            }
+
             if (predictionManager.validateDeterministicData)
             {
                 packer.AdvanceBits(1);

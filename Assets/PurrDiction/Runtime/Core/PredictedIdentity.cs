@@ -198,13 +198,13 @@ namespace PurrNet.Prediction
 
         internal abstract void WriteFirstState(ulong tick, BitPacker packer);
 
-        internal abstract bool WriteCurrentState(PlayerID receiver, BitPacker packer, DeltaModule deltaModule);
+        internal abstract bool WriteCurrentState(PlayerID receiver, BitPacker packer, DeltaModule deltaModule, bool reliable);
 
         internal abstract void WriteInput(ulong localTick, PlayerID receiver, BitPacker input, DeltaModule deltaModule, bool reliable);
 
         internal abstract void ReadFirstState(ulong tick, BitPacker packer);
 
-        internal abstract void ReadState(ulong tick, BitPacker packer, DeltaModule deltaModule);
+        internal abstract void ReadState(ulong tick, BitPacker packer, DeltaModule deltaModule, bool reliable);
 
         internal abstract void ReadInput(ulong tick, PlayerID sender, BitPacker packer, DeltaModule deltaModule, bool reliable);
 

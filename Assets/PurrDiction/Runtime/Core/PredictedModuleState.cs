@@ -163,38 +163,55 @@ namespace PurrNet.Prediction
             _history.Write(tick, fullPredictedState.DeepCopy());
         }
 
-        protected override bool WriteState(PlayerID receiver, BitPacker packer, DeltaModule deltaModule)
+        protected override bool WriteState(PlayerID receiver, BitPacker packer, DeltaModule deltaModule, bool reliable)
         {
-            int flagPos = packer.AdvanceBits(1);
-
-            bool changed = deltaModule.WriteReliable(packer, receiver, predictionKey, fullPredictedState.prediction);
-            changed |= deltaModule.WriteReliable(packer, receiver, stateKey, fullPredictedState.state);
-
-            packer.WriteAt(flagPos, changed);
-
-            if (!changed)
-                packer.SetBitPosition(flagPos + 1);
-
-            return changed;
-        }
-
-        protected override void ReadState(ulong tick, BitPacker packer, DeltaModule deltaModule)
-        {
-            int pos = packer.positionInBits;
-            bool changed = Packer<bool>.Read(packer);
-
-            if (changed)
+            if (reliable)
             {
-                deltaModule.ReadReliable(packer, predictionKey, ref fullPredictedState.prediction);
+                int flagPos = packer.AdvanceBits(1);
+
+                bool changed = deltaModule.WriteReliable(packer, receiver, predictionKey, fullPredictedState.prediction);
+                changed |= deltaModule.WriteReliable(packer, receiver, stateKey, fullPredictedState.state);
+
+                packer.WriteAt(flagPos, changed);
+
+                if (!changed)
+                    packer.SetBitPosition(flagPos + 1);
+
+                return changed;
             }
             else
             {
-                packer.SetBitPosition(pos);
-                deltaModule.ReadReliable(packer, predictionKey, ref fullPredictedState.prediction);
-                packer.SetBitPosition(pos);
+                bool pChanged = deltaModule.Write(packer, receiver, predictionKey, fullPredictedState.prediction);
+                bool sChanged = deltaModule.Write(packer, receiver, stateKey, fullPredictedState.state);
+                return pChanged || sChanged;
+            }
+        }
+
+        protected override void ReadState(ulong tick, BitPacker packer, DeltaModule deltaModule, bool reliable)
+        {
+            if (reliable)
+            {
+                int pos = packer.positionInBits;
+                bool changed = Packer<bool>.Read(packer);
+
+                if (changed)
+                {
+                    deltaModule.ReadReliable(packer, predictionKey, ref fullPredictedState.prediction);
+                }
+                else
+                {
+                    packer.SetBitPosition(pos);
+                    deltaModule.ReadReliable(packer, predictionKey, ref fullPredictedState.prediction);
+                    packer.SetBitPosition(pos);
+                }
+                deltaModule.ReadReliable(packer, stateKey, ref fullPredictedState.state);
+            }
+            else
+            {
+                deltaModule.Read(packer, predictionKey, default, ref fullPredictedState.prediction);
+                deltaModule.Read(packer, stateKey, default, ref fullPredictedState.state);
             }
 
-            deltaModule.ReadReliable(packer, stateKey, ref fullPredictedState.state);
             _history.Write(tick, fullPredictedState.DeepCopy());
         }
 
