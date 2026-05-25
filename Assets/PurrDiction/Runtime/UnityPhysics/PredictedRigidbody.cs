@@ -125,39 +125,45 @@ namespace PurrNet.Prediction
                 _eventMask = PhysicsEventMask.None;
         }
 
-        protected override bool WriteDeltaState(PlayerID target, BitPacker packer, DeltaModule deltaModule)
+        protected override bool WriteDeltaState(PlayerID target, BitPacker packer, DeltaModule deltaModule, bool reliable)
         {
             switch (_floatAccuracy)
             {
                 case FloatAccuracy.Purrfect:
-                    return base.WriteDeltaState(target, packer, deltaModule);
+                    return base.WriteDeltaState(target, packer, deltaModule, reliable);
                 case FloatAccuracy.Medium:
                 {
                     var key = new DeltaKey<UnityRigidbodyCompressedState>(predictionManager.sceneId, id);
-                    return deltaModule.WriteReliable(packer, target, key, new UnityRigidbodyCompressedState(currentState));
+                    var value = new UnityRigidbodyCompressedState(currentState);
+                    return reliable
+                        ? deltaModule.WriteReliable(packer, target, key, value)
+                        : deltaModule.Write(packer, target, key, value);
                 }
                 case FloatAccuracy.Low:
                 {
                     var key = new DeltaKey<UnityRigidbodyHalfState>(predictionManager.sceneId, id);
-                    var res = deltaModule.WriteReliable(packer, target, key, new UnityRigidbodyHalfState(currentState));
-                    return res;
+                    var value = new UnityRigidbodyHalfState(currentState);
+                    return reliable
+                        ? deltaModule.WriteReliable(packer, target, key, value)
+                        : deltaModule.Write(packer, target, key, value);
                 }
                 default: throw new ArgumentOutOfRangeException();
             }
         }
 
-        protected override void ReadDeltaState(BitPacker packer, DeltaModule deltaModule, ref UnityRigidbodyState state)
+        protected override void ReadDeltaState(BitPacker packer, DeltaModule deltaModule, bool reliable, ref UnityRigidbodyState state)
         {
             switch (_floatAccuracy)
             {
                 case FloatAccuracy.Purrfect:
-                    base.ReadDeltaState(packer, deltaModule, ref state);
+                    base.ReadDeltaState(packer, deltaModule, reliable, ref state);
                     break;
                 case FloatAccuracy.Medium:
                 {
                     var key = new DeltaKey<UnityRigidbodyCompressedState>(sceneId, id);
                     UnityRigidbodyCompressedState compressedState = default;
-                    deltaModule.ReadReliable(packer, key, ref compressedState);
+                    if (reliable) deltaModule.ReadReliable(packer, key, ref compressedState);
+                    else          deltaModule.Read(packer, key, default, ref compressedState);
 
                     state.linearVelocity = compressedState.linearVelocity;
                     state.angularVelocity = compressedState.angularVelocity;
@@ -170,7 +176,8 @@ namespace PurrNet.Prediction
                 {
                     var key = new DeltaKey<UnityRigidbodyHalfState>(sceneId, id);
                     UnityRigidbodyHalfState halfState = default;
-                    deltaModule.ReadReliable(packer, key, ref halfState);
+                    if (reliable) deltaModule.ReadReliable(packer, key, ref halfState);
+                    else          deltaModule.Read(packer, key, default, ref halfState);
 
                     state.linearVelocity = halfState.linearVelocity;
                     state.angularVelocity = halfState.angularVelocity;

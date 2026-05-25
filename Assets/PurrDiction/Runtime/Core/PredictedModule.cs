@@ -100,19 +100,19 @@ namespace PurrNet.Prediction
         /// Saves the current state of the module into history for the specified tick.
         /// </summary>
         protected abstract void SaveState(ulong tick);
-        internal bool WriteStateInternal(PlayerID receiver, BitPacker packer, DeltaModule deltaModule)=> WriteState(receiver, packer, deltaModule);
+        internal bool WriteStateInternal(PlayerID receiver, BitPacker packer, DeltaModule deltaModule, bool reliable) => WriteState(receiver, packer, deltaModule, reliable);
 
         /// <summary>
         /// Serializes the current state of the module for network transmission.
         /// </summary>
         /// <returns>True if any data was written (i.e., state changed), otherwise False.</returns>
-        protected abstract bool WriteState(PlayerID receiver, BitPacker packer, DeltaModule deltaModule);
-        internal void ReadStateInternal(ulong tick, BitPacker packer, DeltaModule deltaModule) => ReadState(tick, packer, deltaModule);
+        protected abstract bool WriteState(PlayerID receiver, BitPacker packer, DeltaModule deltaModule, bool reliable);
+        internal void ReadStateInternal(ulong tick, BitPacker packer, DeltaModule deltaModule, bool reliable) => ReadState(tick, packer, deltaModule, reliable);
 
         /// <summary>
         /// Deserializes incoming network data and applies it to the module's state.
         /// </summary>
-        protected abstract void ReadState(ulong tick, BitPacker packer, DeltaModule deltaModule);
+        protected abstract void ReadState(ulong tick, BitPacker packer, DeltaModule deltaModule, bool reliable);
 
         internal void WriteFirstStateInternal(ulong tick, BitPacker packer) => WriteFirstState(tick, packer);
 

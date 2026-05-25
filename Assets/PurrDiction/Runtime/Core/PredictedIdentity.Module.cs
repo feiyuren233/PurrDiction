@@ -504,21 +504,21 @@ namespace PurrNet.Prediction
             for (int i = 0; i < _modules.Count; i++) _modules[i].SaveStateInternal(tick);
         }
 
-        protected bool WriteModules(PlayerID receiver, BitPacker packer, DeltaModule deltaModule)
+        protected bool WriteModules(PlayerID receiver, BitPacker packer, DeltaModule deltaModule, bool reliable)
         {
             bool didWriteAny = false;
             for (int i = 0; i < _modules.Count; i++)
             {
-                didWriteAny |= _modules[i].WriteStateInternal(receiver, packer, deltaModule);
+                didWriteAny |= _modules[i].WriteStateInternal(receiver, packer, deltaModule, reliable);
             }
             return didWriteAny;
         }
 
-        protected void ReadModules(ulong tick, BitPacker packer, DeltaModule deltaModule)
+        protected void ReadModules(ulong tick, BitPacker packer, DeltaModule deltaModule, bool reliable)
         {
             for (int i = 0; i < _modules.Count; i++)
             {
-                _modules[i].ReadStateInternal(tick, packer, deltaModule);
+                _modules[i].ReadStateInternal(tick, packer, deltaModule, reliable);
             }
         }
 

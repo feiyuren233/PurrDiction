@@ -23,6 +23,12 @@ namespace PurrNet.Prediction
         public int maxInputs;
     }
 
+    public enum FrameChannelMode : byte
+    {
+        Reliable,
+        Unreliable
+    }
+
     [DefaultExecutionOrder(1000)]
     [AddComponentMenu("PurrDiction/Prediction Manager")]
     public class PredictionManager : NetworkIdentity
@@ -44,6 +50,8 @@ namespace PurrNet.Prediction
             BuiltInSystems.Players |
             BuiltInSystems.Random;
         [SerializeField] private PredictedPrefabs _predictedPrefabs;
+        [SerializeField, PurrLock] private FrameChannelMode _frameChannelMode = FrameChannelMode.Reliable;
+        [SerializeField, PurrLock] private bool _syncDeterministicData = true;
         [SerializeField] private InputQueueSettings _inputQueueSettings = new()
         {
             extrapolateForMissing = true,
@@ -65,6 +73,10 @@ namespace PurrNet.Prediction
         }
 
         public bool validateDeterministicData => _validateDeterministicData;
+
+        public FrameChannelMode frameChannelMode => _frameChannelMode;
+        public bool isReliable => _frameChannelMode == FrameChannelMode.Reliable;
+        public bool syncDeterministicData => _syncDeterministicData;
 
         static readonly ProfilerMarker SimulateMarker = new("PredictionManager.Simulate");
         static readonly ProfilerMarker SimulateInputsMarker = new("PredictionManager.PrepareSimulationInputs");
@@ -762,11 +774,11 @@ namespace PurrNet.Prediction
                     if (_systems[i].isEventHandler)
                         continue;
 
-                    _systems[i].RunWriteCurrentState(player, frame, _deltaModuleState);
+                    _systems[i].RunWriteCurrentState(player, frame, _deltaModuleState, isReliable);
                 }
 
                 for (var i = 0; i < _systemsCount; i++)
-                    _systems[i].WriteInput(localTick, player, frame, _deltaModuleState, true);
+                    _systems[i].WriteInput(localTick, player, frame, _deltaModuleState, isReliable);
             }
         }
 
@@ -785,7 +797,7 @@ namespace PurrNet.Prediction
                 {
                     var frame = _clientFrames[j];
                     var packer = frame.packer;
-                    system.RunWriteCurrentState(frame.player, packer, _deltaModuleState);
+                    system.RunWriteCurrentState(frame.player, packer, _deltaModuleState, isReliable);
                 }
             }
         }
@@ -898,8 +910,25 @@ namespace PurrNet.Prediction
 
         readonly Queue<FrameDelta> _deltas = new ();
 
-        [TargetRpc(compressionLevel: CompressionLevel.Best)]
-        private void SendFrameToRemote([UsedImplicitly] PlayerID player, ulong localTick, BitPackerWithLength delta)
+        private void SendFrameToRemote(PlayerID player, ulong localTick, BitPackerWithLength delta)
+        {
+            if (isReliable) SendFrameToRemoteReliable(player, localTick, delta);
+            else            SendFrameToRemoteUnreliable(player, localTick, delta);
+        }
+
+        [TargetRpc(compressionLevel: CompressionLevel.Best, channel: Channel.ReliableOrdered)]
+        private void SendFrameToRemoteReliable([UsedImplicitly] PlayerID player, ulong localTick, BitPackerWithLength delta)
+        {
+            delta.packer.SkipBytes(delta.originalLength);
+            _deltas.Enqueue(new FrameDelta
+            {
+                packer = delta.packer,
+                clientTick = localTick
+            });
+        }
+
+        [TargetRpc(compressionLevel: CompressionLevel.Best, channel: Channel.UnreliableSequenced)]
+        private void SendFrameToRemoteUnreliable([UsedImplicitly] PlayerID player, ulong localTick, BitPackerWithLength delta)
         {
             delta.packer.SkipBytes(delta.originalLength);
             _deltas.Enqueue(new FrameDelta
@@ -932,13 +961,13 @@ namespace PurrNet.Prediction
                 if (_validateDeterministicData && system.isDeterministic)
                     system.RunRollback(stateTick);
                 system.RunClearFuture(stateTick);
-                system.RunReadState(stateTick, frame, _deltaModuleState);
+                system.RunReadState(stateTick, frame, _deltaModuleState, isReliable);
                 system.RunRollback(stateTick);
                 system.lastVerifiedTick = stateTick;
             }
 
             for (var i = 0; i < count; ++i)
-                _systems[i].ReadInput(inputTick, default, frame, _deltaModuleState, true);
+                _systems[i].ReadInput(inputTick, default, frame, _deltaModuleState, isReliable);
 
             for (var i = 0; i < count; ++i)
             {
@@ -946,7 +975,7 @@ namespace PurrNet.Prediction
                 if (!system.isEventHandler)
                     continue;
                 system.RunClearFuture(stateTick);
-                system.RunReadState(stateTick, frame, _deltaModuleState);
+                system.RunReadState(stateTick, frame, _deltaModuleState, isReliable);
                 system.RunRollback(stateTick);
                 system.lastVerifiedTick = stateTick;
             }
@@ -1014,7 +1043,7 @@ namespace PurrNet.Prediction
                     _playedFirst = true;
                 }
 
-                RollbackToFrame(previousFrame.packer, inPlaceTick, verifiedTick);
+                RollbackToFrame(previousFrame.packer, verifiedTick, verifiedTick);
                 SimulateFrame(verifiedTick, true);
                 isVerified = false;
             }
