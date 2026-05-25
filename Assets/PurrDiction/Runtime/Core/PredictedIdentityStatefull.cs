@@ -226,9 +226,12 @@ namespace PurrNet.Prediction
             }
             else
             {
-                bool pChanged = deltaModule.Write(packer, target, internalKey, fullPredictedState.prediction);
-                bool sChanged = WriteDeltaState(target, packer, deltaModule, reliable);
-                changed = pChanged || sChanged;
+                int flagPos = packer.AdvanceBits(1);
+                changed = deltaModule.Write(packer, target, internalKey, fullPredictedState.prediction);
+                changed = WriteDeltaState(target, packer, deltaModule, reliable) || changed;
+                packer.WriteAt(flagPos, changed);
+                if (!changed)
+                    packer.SetBitPosition(flagPos + 1);
             }
 
             TickBandwidthProfiler.OnWroteState(myType, packer.positionInBits - pos, this);
@@ -261,13 +264,21 @@ namespace PurrNet.Prediction
                     deltaModule.ReadReliable(packer, internalKey, ref newState.prediction);
                     packer.SetBitPosition(pos);
                 }
+                ReadDeltaState(packer, deltaModule, reliable, ref newState.state);
             }
             else
             {
-                deltaModule.Read(packer, internalKey, default, ref newState.prediction);
+                bool changed = Packer<bool>.Read(packer);
+                if (changed)
+                {
+                    deltaModule.Read(packer, internalKey, default, ref newState.prediction);
+                    ReadDeltaState(packer, deltaModule, reliable, ref newState.state);
+                }
+                else if (_stateHistory.ReadOrPrevious(tick, out var prev))
+                {
+                    newState = prev.DeepCopy();
+                }
             }
-
-            ReadDeltaState(packer, deltaModule, reliable, ref newState.state);
 
             _stateHistory.Write(tick, newState);
             TickBandwidthProfiler.OnReadState(myType, packer.positionInBits - pos, this);
