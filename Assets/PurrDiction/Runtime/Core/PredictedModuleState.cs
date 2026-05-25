@@ -181,9 +181,14 @@ namespace PurrNet.Prediction
             }
             else
             {
-                bool pChanged = deltaModule.Write(packer, receiver, predictionKey, fullPredictedState.prediction);
-                bool sChanged = deltaModule.Write(packer, receiver, stateKey, fullPredictedState.state);
-                return pChanged || sChanged;
+                int flagPos = packer.AdvanceBits(1);
+
+                bool changed = deltaModule.Write(packer, receiver, predictionKey, fullPredictedState.prediction);
+                changed |= deltaModule.Write(packer, receiver, stateKey, fullPredictedState.state);
+                packer.WriteAt(flagPos, changed);
+                if (!changed)
+                    packer.SetBitPosition(flagPos + 1);
+                return changed;
             }
         }
 
@@ -197,19 +202,25 @@ namespace PurrNet.Prediction
                 if (changed)
                 {
                     deltaModule.ReadReliable(packer, predictionKey, ref fullPredictedState.prediction);
+                    deltaModule.ReadReliable(packer, stateKey, ref fullPredictedState.state);
                 }
                 else
                 {
                     packer.SetBitPosition(pos);
                     deltaModule.ReadReliable(packer, predictionKey, ref fullPredictedState.prediction);
+
                     packer.SetBitPosition(pos);
+                    deltaModule.ReadReliable(packer, stateKey, ref fullPredictedState.state);
                 }
-                deltaModule.ReadReliable(packer, stateKey, ref fullPredictedState.state);
             }
             else
             {
-                deltaModule.Read(packer, predictionKey, default, ref fullPredictedState.prediction);
-                deltaModule.Read(packer, stateKey, default, ref fullPredictedState.state);
+                bool changed = Packer<bool>.Read(packer);
+                if (changed)
+                {
+                    deltaModule.Read(packer, predictionKey, default, ref fullPredictedState.prediction);
+                    deltaModule.Read(packer, stateKey, default, ref fullPredictedState.state);
+                }
             }
 
             _history.Write(tick, fullPredictedState.DeepCopy());
