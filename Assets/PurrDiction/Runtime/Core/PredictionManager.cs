@@ -1043,7 +1043,7 @@ namespace PurrNet.Prediction
                     _playedFirst = true;
                 }
 
-                RollbackToFrame(previousFrame.packer, verifiedTick, verifiedTick);
+                RollbackToFrame(previousFrame.packer, inPlaceTick, verifiedTick);
                 SimulateFrame(verifiedTick, true);
                 isVerified = false;
             }
