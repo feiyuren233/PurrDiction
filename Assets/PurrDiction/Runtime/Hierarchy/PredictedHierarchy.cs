@@ -12,6 +12,9 @@ namespace PurrNet.Prediction
         readonly Dictionary<PredictedObjectID, GameObject> _instanceMap = new ();
         readonly Dictionary<GameObject, PredictedObjectID> _goToId = new ();
         readonly HashSet<PredictedObjectID> _isSceneObject = new ();
+        readonly HashSet<PredictedComponentID> _sleepingIds = new();
+        readonly HashSet<PredictedComponentID> _tempSleepSet = new();
+        readonly List<(PredictedComponentID id, bool sleep)> _pendingSleepChanges = new();
 
         private uint _nextInstanceId = 2;
 
@@ -20,7 +23,8 @@ namespace PurrNet.Prediction
             var state = new PredictedHierarchyState(
                 DisposableList<InstanceDetails>.Create(16),
                 DisposableList<PredictedObjectID>.Create(16),
-                _nextInstanceId);
+                _nextInstanceId,
+                DisposableList<PredictedComponentID>.Create(8));
             return state;
         }
 
@@ -133,6 +137,8 @@ namespace PurrNet.Prediction
                 }
             }
 #endif
+            _pendingSleepChanges.Clear();
+            SyncSleepingSet(state.sleepingIds);
             _nextInstanceId = state.nextInstanceId;
             _isRollingBack = false;
         }
@@ -226,6 +232,25 @@ namespace PurrNet.Prediction
             for (var o = 0; o < state.toDelete.Count; o++)
                 DeleteNow(state.toDelete[o]);
             state.toDelete.Clear();
+            DrainPendingSleep(ref state);
+            SyncSleepingSet(state.sleepingIds);
+        }
+
+        private void DrainPendingSleep(ref PredictedHierarchyState state)
+        {
+            foreach (var (id, sleep) in _pendingSleepChanges)
+            {
+                if (sleep)
+                {
+                    if (!state.sleepingIds.Contains(id))
+                        state.sleepingIds.Add(id);
+                }
+                else
+                {
+                    state.sleepingIds.Remove(id);
+                }
+            }
+            _pendingSleepChanges.Clear();
         }
 
         private void LateUpdate()
@@ -480,6 +505,48 @@ namespace PurrNet.Prediction
             _goToId.Clear();
             _spawnedPrefabs.Clear();
             _isSceneObject.Clear();
+        }
+
+        public void SetSleeping(PredictedComponentID id, bool sleeping)
+        {
+            _pendingSleepChanges.Add((id, sleeping));
+        }
+
+        public void SetSleeping(PredictedObjectID objectId, bool sleeping)
+        {
+            if (!TryGetGameObject(objectId, out var go)) return;
+            var components = go.GetComponentsInChildren<PredictedIdentity>(true);
+            foreach (var c in components)
+                SetSleeping(c.id, sleeping);
+        }
+
+        private void SyncSleepingSet(DisposableList<PredictedComponentID> desired)
+        {
+            _tempSleepSet.Clear();
+            for (int i = 0; i < desired.Count; i++)
+                _tempSleepSet.Add(desired[i]);
+
+            foreach (var id in _sleepingIds)
+            {
+                if (!_tempSleepSet.Contains(id) && predictionManager.TryGetIdentity(id, out var identity))
+                {
+                    identity._sleeping = false;
+                    predictionManager.RecomputeRoleFor(identity);
+                    predictionManager.AddToViewActive(identity);
+                }
+            }
+
+            foreach (var id in _tempSleepSet)
+            {
+                if (!_sleepingIds.Contains(id) && predictionManager.TryGetIdentity(id, out var identity))
+                {
+                    identity._sleeping = true;
+                    predictionManager.RecomputeRoleFor(identity);
+                }
+            }
+
+            _sleepingIds.Clear();
+            _sleepingIds.UnionWith(_tempSleepSet);
         }
 
         public override void UpdateRollbackInterpolationState(float delta, bool accumulateError) { }

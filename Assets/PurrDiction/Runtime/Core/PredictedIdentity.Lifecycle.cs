@@ -57,6 +57,7 @@ namespace PurrNet.Prediction
 
         internal bool RunWriteCurrentState(PlayerID receiver, BitPacker packer, DeltaModule deltaModule, bool reliable)
         {
+            if (_sleeping) return false;
             bool moduleSetChanged = WriteDynamicModuleSnapshot(receiver, packer, deltaModule);
             bool modulesChanged = WriteModules(receiver, packer, deltaModule, reliable);
             bool identityChanged = WriteCurrentState(receiver, packer, deltaModule, reliable);
@@ -66,6 +67,7 @@ namespace PurrNet.Prediction
 
         internal void RunReadState(ulong tick, BitPacker packer, DeltaModule deltaModule, bool reliable)
         {
+            if (_sleeping) return;
             ReadDynamicModuleSnapshot(tick, packer, deltaModule);
             ReadModules(tick, packer, deltaModule, reliable);
             ReadState(tick, packer, deltaModule, reliable);
@@ -94,6 +96,7 @@ namespace PurrNet.Prediction
 
         internal void RunWriteInput(ulong localTick, PlayerID receiver, BitPacker input, DeltaModule deltaModule, bool reliable)
         {
+            if (_sleeping) return;
             if (receiver != default(PlayerID) && !forwardInput) return;
             WriteInput(localTick, receiver, input, deltaModule, reliable);
         }

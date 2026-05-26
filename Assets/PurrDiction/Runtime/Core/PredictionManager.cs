@@ -94,6 +94,8 @@ namespace PurrNet.Prediction
         readonly List<PredictedIdentity> _firesObserverSimAtVerifiedArrival = new ();
         readonly List<PredictedIdentity> _firesObserverSimAtForwardReplay = new ();
 
+        readonly HashSet<PredictedIdentity> _viewActiveSystems = new();
+
         internal enum SimulateRole
         {
             None,
@@ -467,6 +469,7 @@ namespace PurrNet.Prediction
             ++_systemsCount;
 
             RecomputeRoleFor(system);
+            _viewActiveSystems.Add(system);
         }
 
         public void UnregisterInstance(PredictedIdentity predictedIdentity)
@@ -477,6 +480,7 @@ namespace PurrNet.Prediction
             if (role.FiresObserverSimAtVerifiedArrival()) _firesObserverSimAtVerifiedArrival.Remove(predictedIdentity);
             if (role.FiresObserverSimAtForwardReplay())   _firesObserverSimAtForwardReplay.Remove(predictedIdentity);
             predictedIdentity.currentRole = SimulateRole.None;
+            _viewActiveSystems.Remove(predictedIdentity);
 
             _instanceMap.Remove(predictedIdentity.id);
             if (_systems.Remove(predictedIdentity))
@@ -532,8 +536,28 @@ namespace PurrNet.Prediction
             }
         }
 
+        internal void AddToViewActive(PredictedIdentity identity)
+        {
+            _viewActiveSystems.Add(identity);
+        }
+
+        private void CleanupSettledFromViewActive()
+        {
+            _viewActiveSystems.RemoveWhere(sys =>
+            {
+                if (sys._sleeping && sys.IsViewConverged())
+                {
+                    sys.RunResetInterpolation();
+                    return true;
+                }
+                return false;
+            });
+        }
+
         internal SimulateRole ComputeRole(PredictedIdentity sys)
         {
+            if (sys._sleeping) return SimulateRole.None;
+
             if (sys.isController || isServer)
                 return SimulateRole.ControllerAuthority;
 
@@ -830,7 +854,7 @@ namespace PurrNet.Prediction
             for (var ownedIdx = 0; ownedIdx < count; ownedIdx++)
             {
                 var owned = ownedIdentities[ownedIdx];
-                if (owned && owned.hasInput)
+                if (owned && owned.hasInput && !owned._sleeping)
                 {
                     Packer<PredictedComponentID>.Write(frame, owned.id);
                     owned.RunWriteInput(localTick, default, frame, _deltaModuleState, false);
@@ -848,9 +872,12 @@ namespace PurrNet.Prediction
             for (var systemIdx = 0; systemIdx < _systemsCount; systemIdx++)
             {
                 var system = _systems[systemIdx];
-                system.GetLatestUnityState();
-                system.RunUpdateRollbackInterpolation(tickDelta, false);
+                if (!system._sleeping)
+                    system.GetLatestUnityState();
             }
+            foreach (var sys in _viewActiveSystems)
+                sys.RunUpdateRollbackInterpolation(tickDelta, false);
+            CleanupSettledFromViewActive();
         }
 
         private void ResetAllPackers()
@@ -1172,8 +1199,9 @@ namespace PurrNet.Prediction
 
         private void UpdateInterpolation(bool accumulateError)
         {
-            for (var j = 0; j < _systemsCount; j++)
-                _systems[j].RunUpdateRollbackInterpolation(tickDelta, accumulateError);
+            foreach (var sys in _viewActiveSystems)
+                sys.RunUpdateRollbackInterpolation(tickDelta, accumulateError);
+            CleanupSettledFromViewActive();
         }
 
         private void ReplayToLatestTick(ulong verifiedTick, bool saveState)
@@ -1502,8 +1530,8 @@ namespace PurrNet.Prediction
             try
             {
                 var dt = Time.unscaledDeltaTime;
-                for (var i = 0; i < _systemsCount; i++)
-                    _systems[i].RunUpdateView(dt);
+                foreach (var sys in _viewActiveSystems)
+                    sys.RunUpdateView(dt);
             }
             catch (Exception e)
             {
@@ -1523,8 +1551,8 @@ namespace PurrNet.Prediction
             try
             {
                 var dt = Time.unscaledDeltaTime;
-                for (var i = 0; i < _systemsCount; i++)
-                    _systems[i].RunLateUpdateView(dt);
+                foreach (var sys in _viewActiveSystems)
+                    sys.RunLateUpdateView(dt);
             }
             catch (Exception e)
             {

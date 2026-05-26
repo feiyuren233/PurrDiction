@@ -73,6 +73,15 @@ namespace PurrNet.Prediction
 
         internal bool isFreshSpawn = true;
 
+        internal bool _sleeping;
+
+        public bool isSleeping => _sleeping;
+
+        public void SetSleeping(bool sleeping)
+        {
+            predictionManager.hierarchy.SetSleeping(id, sleeping);
+        }
+
         /// <summary>
         /// This identity's current SimulateRole on the local PredictionManager. Maintained by
         /// PredictionManager.RecomputeRoleFor — DO NOT mutate directly.
@@ -247,6 +256,8 @@ namespace PurrNet.Prediction
         public abstract void UpdateRollbackInterpolationState(float delta, bool accumulateError);
 
         public abstract void ResetInterpolation();
+
+        internal virtual bool IsViewConverged() => true;
 
         private PlayerID? _lastOwner;
 

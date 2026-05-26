@@ -8,18 +8,25 @@ namespace PurrNet.Prediction
         public DisposableList<InstanceDetails> spawnedPrefabs;
         public DisposableList<PredictedObjectID> toDelete;
         public uint nextInstanceId;
+        public DisposableList<PredictedComponentID> sleepingIds;
 
-        public PredictedHierarchyState(DisposableList<InstanceDetails> spawnedPrefabs, DisposableList<PredictedObjectID> toDelete, uint nextInstanceId)
+        public PredictedHierarchyState(
+            DisposableList<InstanceDetails> spawnedPrefabs,
+            DisposableList<PredictedObjectID> toDelete,
+            uint nextInstanceId,
+            DisposableList<PredictedComponentID> sleepingIds)
         {
             this.spawnedPrefabs = spawnedPrefabs;
             this.nextInstanceId = nextInstanceId;
             this.toDelete = toDelete;
+            this.sleepingIds = sleepingIds;
         }
 
         public void Dispose()
         {
             spawnedPrefabs.Dispose();
             toDelete.Dispose();
+            sleepingIds.Dispose();
         }
 
         public PredictedHierarchyState Duplicate()
@@ -27,7 +34,8 @@ namespace PurrNet.Prediction
             return new PredictedHierarchyState(
                 spawnedPrefabs.Duplicate(),
                 toDelete.Duplicate(),
-                nextInstanceId
+                nextInstanceId,
+                sleepingIds.Duplicate()
             );
         }
 

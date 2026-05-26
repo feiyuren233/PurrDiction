@@ -237,6 +237,17 @@ namespace PurrNet.Prediction
 
         protected virtual void ModifyRollbackViewState(ref STATE state, float delta, bool accumulateError) { }
 
+        protected virtual bool IsViewSettled(STATE viewState, STATE authoritativeState)
+        {
+            return Packer.AreEqual(viewState, authoritativeState);
+        }
+
+        internal override bool IsViewConverged()
+        {
+            if (_viewState == null) return true;
+            return IsViewSettled(_viewState.Value.state, fullPredictedState.state);
+        }
+
         protected virtual STATE GetInitialState() => default;
 
         internal override void Rollback(ulong tick)
