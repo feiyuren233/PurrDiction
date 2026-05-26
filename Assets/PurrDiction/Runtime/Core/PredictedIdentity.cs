@@ -1,12 +1,48 @@
+using System.Runtime.CompilerServices;
 using PurrNet.Modules;
 using PurrNet.Packing;
 using Unity.Profiling;
 using UnityEngine;
 
+[assembly: InternalsVisibleTo("PurrDiction.Tests")]
+
 namespace PurrNet.Prediction
 {
     public abstract partial class PredictedIdentity : MonoBehaviour
     {
+        [SerializeField, Tooltip(
+            "When true (default), this identity's input is forwarded to observers and they run " +
+            "Simulate locally — full prediction as today. " +
+            "When false, input is NOT forwarded; the server still sends pre-sim state in the existing " +
+            "WriteInitialFrameToOthers pass (alongside regular non-event-handler identities), just " +
+            "without the paired input. Observers never run Simulate for this identity — input-driven " +
+            "side effects inside Simulate will not fire on observers, so express them as state " +
+            "transitions and react in UpdateView.")]
+        private bool _forwardInput = true;
+
+        public bool forwardInput => _forwardInput;
+
+        [SerializeField, Tooltip(
+            "When true (default), observers run Simulate forward to localTick during replay — full prediction as today.\n" +
+            "When false, observers skip the forward Simulate loop. The verified-tick Simulate still runs once per " +
+            "server frame (with authoritative input) for input-forwarded identities, so input-driven Simulate() side " +
+            "effects still fire on observers — just once per verified tick instead of every replay tick. Forward state " +
+            "projection between verified ticks is handled by ExtrapolateState. CPU savings on observers scale linearly " +
+            "with the replay depth (typically 3–10× the per-tick Simulate cost saved per identity per OnPostTick).\n" +
+            "Has no effect when _forwardInput == false (Mode C already skips all observer simulation).")]
+        private bool _simulateForward = true;
+
+        public bool simulateForward
+        {
+            get => _simulateForward;
+            set
+            {
+                if (_simulateForward == value) return;
+                _simulateForward = value;
+                predictionManager?.RecomputeRoleFor(this);
+            }
+        }
+
         public ulong? lastVerifiedTick { get; internal set; }
 
         public virtual string GetExtraString()
@@ -36,6 +72,12 @@ namespace PurrNet.Prediction
         public PredictedComponentID id;
 
         internal bool isFreshSpawn = true;
+
+        /// <summary>
+        /// This identity's current SimulateRole on the local PredictionManager. Maintained by
+        /// PredictionManager.RecomputeRoleFor — DO NOT mutate directly.
+        /// </summary>
+        internal PredictionManager.SimulateRole currentRole;
 
         public virtual bool hasInput => false;
 
@@ -99,6 +141,10 @@ namespace PurrNet.Prediction
                 return;
 
             isFreshSpawn = false;
+            Debug.Assert(!(isEventHandler && !_forwardInput),
+                $"PurrDiction: identity '{GetType().Name}' cannot be both isEventHandler and state-only " +
+                $"(_forwardInput = false). Event handlers depend on observer-side simulation participation; " +
+                $"state-only mode skips that participation.");
             predictionManager = world;
             sceneId = world.sceneId;
 
@@ -165,6 +211,27 @@ namespace PurrNet.Prediction
             return asServer;
         }
 
+        /// <summary>
+        /// True when the per-identity simulate phase should be skipped on this client this tick.
+        /// Triggers only for state-only identities on non-owner observers.
+        /// </summary>
+        internal bool SkipObserverSimulation()
+            => !_forwardInput && !predictionManager.cachedIsServer && !isController;
+
+        /// <summary>
+        /// True when the per-tick FORWARD Simulate phase should be skipped on this client this tick.
+        /// </summary>
+        internal bool SkipObserverForwardSimulate()
+            => (!_forwardInput || !_simulateForward) && !predictionManager.cachedIsServer && !isController;
+
+        public virtual bool extrapolateState
+        {
+            get => false;
+            set { }
+        }
+
+        internal virtual void RunObserverSimulateTick(ulong tick, float delta, ulong lastAuthoritativeTick, bool isVerifiedArrival) { }
+
         internal abstract void SimulateTick(ulong tick, float delta);
 
         internal abstract void LateSimulateTick(float delta);
@@ -196,6 +263,7 @@ namespace PurrNet.Prediction
             if (owner != _lastOwner)
             {
                 OnViewOwnerChanged(_lastOwner, owner);
+                predictionManager?.RecomputeRoleFor(this);
                 _lastOwner = owner;
             }
         }

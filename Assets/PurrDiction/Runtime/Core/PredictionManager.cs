@@ -89,6 +89,23 @@ namespace PurrNet.Prediction
         readonly List<PredictedIdentity> _systems = new ();
         private int _systemsCount;
 
+        readonly List<PredictedIdentity> _firesInputSimAtVerifiedPass = new ();
+        readonly List<PredictedIdentity> _firesInputSimAtForwardReplay = new ();
+        readonly List<PredictedIdentity> _firesObserverSimAtVerifiedArrival = new ();
+        readonly List<PredictedIdentity> _firesObserverSimAtForwardReplay = new ();
+
+        internal enum SimulateRole
+        {
+            None,
+            ControllerAuthority,
+            ObserverInputSimForward,
+            ObserverInputVerifiedOnly,
+            ObserverInputVerifiedStateExtrapolate,
+            ObserverStateForward,
+            ObserverStateVerifiedOnly,
+            ObserverStateVerifiedExtrapolate,
+        }
+
         GameObjectPoolCollection _pools;
 
         [UsedImplicitly]
@@ -264,6 +281,7 @@ namespace PurrNet.Prediction
             _tickManager = networkManager.tickModule;
             _tickManager.onPreTick += OnPreTick;
             _tickManager.onPostTick += OnPostTick;
+            networkManager.onLocalPlayerReceivedID += OnLocalPlayerChanged;
         }
 
         protected override void OnDespawned()
@@ -275,7 +293,14 @@ namespace PurrNet.Prediction
                 _tickManager = null;
             }
 
+            networkManager.onLocalPlayerReceivedID -= OnLocalPlayerChanged;
+
             CleanupAllSystems();
+        }
+
+        private void OnLocalPlayerChanged(PlayerID _)
+        {
+            RecomputeAllRoles();
         }
 
         protected override void OnDestroy()
@@ -440,13 +465,97 @@ namespace PurrNet.Prediction
 
             _systems.Insert(posToInsert, system);
             ++_systemsCount;
+
+            RecomputeRoleFor(system);
         }
 
         public void UnregisterInstance(PredictedIdentity predictedIdentity)
         {
+            var role = predictedIdentity.currentRole;
+            if (role.FiresInputSimAtVerifiedPass())       _firesInputSimAtVerifiedPass.Remove(predictedIdentity);
+            if (role.FiresInputSimAtForwardReplay())      _firesInputSimAtForwardReplay.Remove(predictedIdentity);
+            if (role.FiresObserverSimAtVerifiedArrival()) _firesObserverSimAtVerifiedArrival.Remove(predictedIdentity);
+            if (role.FiresObserverSimAtForwardReplay())   _firesObserverSimAtForwardReplay.Remove(predictedIdentity);
+            predictedIdentity.currentRole = SimulateRole.None;
+
             _instanceMap.Remove(predictedIdentity.id);
             if (_systems.Remove(predictedIdentity))
                 --_systemsCount;
+        }
+
+        internal void RecomputeRoleFor(PredictedIdentity sys)
+        {
+            var oldR = sys.currentRole;
+            var newR = ComputeRole(sys);
+            if (oldR == newR) return;
+
+            UpdateBucket(_firesInputSimAtVerifiedPass,       sys, oldR.FiresInputSimAtVerifiedPass(),       newR.FiresInputSimAtVerifiedPass());
+            UpdateBucket(_firesInputSimAtForwardReplay,      sys, oldR.FiresInputSimAtForwardReplay(),      newR.FiresInputSimAtForwardReplay());
+            UpdateBucket(_firesObserverSimAtVerifiedArrival, sys, oldR.FiresObserverSimAtVerifiedArrival(), newR.FiresObserverSimAtVerifiedArrival());
+            UpdateBucket(_firesObserverSimAtForwardReplay,   sys, oldR.FiresObserverSimAtForwardReplay(),   newR.FiresObserverSimAtForwardReplay());
+
+            sys.currentRole = newR;
+        }
+
+        void UpdateBucket(List<PredictedIdentity> bucket, PredictedIdentity sys, bool oldIn, bool newIn)
+        {
+            if (oldIn == newIn) return;
+            if (newIn) InsertSorted(bucket, sys);
+            else bucket.Remove(sys);
+        }
+
+        private static void InsertSorted(List<PredictedIdentity> bucket, PredictedIdentity system)
+        {
+            var myObjId = system.id.objectId.instanceId.value;
+            var myCompId = system.id.componentId.value;
+            int posToInsert = bucket.Count;
+
+            for (int i = 0; i < bucket.Count; i++)
+            {
+                var curObjId = bucket[i].id.objectId.instanceId.value;
+                if (curObjId > myObjId || curObjId == myObjId && bucket[i].id.componentId.value > myCompId)
+                {
+                    posToInsert = i;
+                    break;
+                }
+            }
+
+            bucket.Insert(posToInsert, system);
+        }
+
+        internal void RecomputeAllRoles()
+        {
+            for (int i = 0; i < _systemsCount; i++)
+            {
+                var system = _systems[i];
+                if (system) RecomputeRoleFor(system);
+            }
+        }
+
+        internal SimulateRole ComputeRole(PredictedIdentity sys)
+        {
+            if (sys.isController || isServer)
+                return SimulateRole.ControllerAuthority;
+
+            if (!sys.hasInput)
+            {
+                if (sys.simulateForward) return SimulateRole.ObserverStateForward;
+                return sys.extrapolateState
+                    ? SimulateRole.ObserverStateVerifiedExtrapolate
+                    : SimulateRole.ObserverStateVerifiedOnly;
+            }
+
+            if (sys.forwardInput)
+            {
+                if (sys.simulateForward) return SimulateRole.ObserverInputSimForward;
+                return sys.extrapolateState
+                    ? SimulateRole.ObserverInputVerifiedStateExtrapolate
+                    : SimulateRole.ObserverInputVerifiedOnly;
+            }
+
+            return sys.extrapolateState
+                ? SimulateRole.ObserverStateVerifiedExtrapolate
+                : SimulateRole.ObserverStateVerifiedOnly;
         }
 
         protected override void OnObserverRemoved(PlayerID player)
@@ -499,7 +608,7 @@ namespace PurrNet.Prediction
             }
 
             for (var i = 0; i < _systemsCount; i++)
-                _systems[i].WriteFirstInput(tick, frame);
+                _systems[i].RunWriteFirstInput(tick, frame);
 
             for (var i = 0; i < _systemsCount; i++)
             {
@@ -538,7 +647,7 @@ namespace PurrNet.Prediction
             }
 
             for (var i = 0; i < count; i++)
-                _systems[i].ReadFirstInput(1, data);
+                _systems[i].RunReadFirstInput(1, data);
 
             for (var i = 0; i < count; i++)
             {
@@ -553,6 +662,10 @@ namespace PurrNet.Prediction
                 system.RunSaveState(1);
                 system.lastVerifiedTick = 1;
             }
+
+            for (var j = 0; j < _firesObserverSimAtVerifiedArrival.Count; j++)
+                _firesObserverSimAtVerifiedArrival[j].RunObserverSimulateTick(
+                    2, tickDelta, 1, isVerifiedArrival: true);
 
             SyncTransforms();
 
@@ -571,7 +684,6 @@ namespace PurrNet.Prediction
             localTickInContext = localTick;
 
             var myPlayer = isSpawned ? localPlayer ?? default : default;
-            var cachedIsClient = isClient;
 
             isSimulating = true;
             if (cachedIsServer)
@@ -582,9 +694,9 @@ namespace PurrNet.Prediction
 
             using var ownedIdentities = DisposableList<PredictedIdentity>.Create(_systemsCount);
 
-            for (var i = 0; i < _systemsCount; i++)
+            for (var i = 0; i < _firesInputSimAtVerifiedPass.Count; i++)
             {
-                var system = _systems[i];
+                var system = _firesInputSimAtVerifiedPass[i];
                 bool controller = system.IsOwner(myPlayer, cachedIsServer);
                 if (controller)
                     ownedIdentities.Add(system);
@@ -593,9 +705,9 @@ namespace PurrNet.Prediction
 
             using (SaveHistoryMarker.Auto())
             {
-                for (var i = 0; i < _systemsCount; i++)
+                for (var i = 0; i < _firesInputSimAtVerifiedPass.Count; i++)
                 {
-                    var system = _systems[i];
+                    var system = _firesInputSimAtVerifiedPass[i];
                     if (!system.isEventHandler)
                         system.RunSaveState(localTick);
                 }
@@ -617,15 +729,15 @@ namespace PurrNet.Prediction
 
             using (SimulateInputsMarker.Auto())
             {
-                for (var i = 0; i < _systemsCount; i++)
-                    _systems[i].OnPrepareSimulationInputs(localTick, delta);
+                for (var i = 0; i < _firesInputSimAtVerifiedPass.Count; i++)
+                    _firesInputSimAtVerifiedPass[i].OnPrepareSimulationInputs(localTick, delta);
             }
 
             var simulateMarker = SimulateMarker.Auto();
             try
             {
-                for (var i = 0; i < _systemsCount; i++)
-                    _systems[i].RunSimulateTick(localTick, delta);
+                for (var i = 0; i < _firesInputSimAtVerifiedPass.Count; i++)
+                    _firesInputSimAtVerifiedPass[i].RunSimulateTick(localTick, delta);
             }
             catch (Exception e)
             {
@@ -641,8 +753,8 @@ namespace PurrNet.Prediction
             var lateSimulateMarker = LateSimulateMarker.Auto();
             try
             {
-                for (var i = 0; i < _systemsCount; i++)
-                    _systems[i].RunLateSimulateTick(delta);
+                for (var i = 0; i < _firesInputSimAtVerifiedPass.Count; i++)
+                    _firesInputSimAtVerifiedPass[i].RunLateSimulateTick(delta);
             }
             catch (Exception e)
             {
@@ -674,11 +786,11 @@ namespace PurrNet.Prediction
                 }
             }
 
-            for (var i = 0; i < _systemsCount; i++)
-                _systems[i].PostSimulate();
+            for (var i = 0; i < _firesInputSimAtVerifiedPass.Count; i++)
+                _firesInputSimAtVerifiedPass[i].PostSimulate();
 
             if (cachedIsServer)
-                FinalizeTickOnServer(cachedIsClient);
+                FinalizeTickOnServer();
             else FinalizeInputOnClient(ownedIdentities);
 
             isSimulating = false;
@@ -708,9 +820,9 @@ namespace PurrNet.Prediction
 
             using var frame = BitPackerPool.Get();
             uint writtenCount = 0;
-            for (var systemIdx = 0; systemIdx < _systemsCount; systemIdx++)
+            for (var systemIdx = 0; systemIdx < _firesInputSimAtVerifiedPass.Count; systemIdx++)
             {
-                var system = _systems[systemIdx];
+                var system = _firesInputSimAtVerifiedPass[systemIdx];
                 system.GetLatestUnityState();
             }
 
@@ -721,7 +833,7 @@ namespace PurrNet.Prediction
                 if (owned && owned.hasInput)
                 {
                     Packer<PredictedComponentID>.Write(frame, owned.id);
-                    owned.WriteInput(localTick, default, frame, _deltaModuleState, false);
+                    owned.RunWriteInput(localTick, default, frame, _deltaModuleState, false);
                     writtenCount += 1;
                 }
             }
@@ -731,21 +843,13 @@ namespace PurrNet.Prediction
             else SendInputToServer(localTick,writtenCount, frame);
         }
 
-        private void FinalizeTickOnServer(bool cachedIsClient)
+        private void FinalizeTickOnServer()
         {
-            if (cachedIsClient)
+            for (var systemIdx = 0; systemIdx < _systemsCount; systemIdx++)
             {
-                for (var systemIdx = 0; systemIdx < _systemsCount; systemIdx++)
-                {
-                    var system = _systems[systemIdx];
-                    system.GetLatestUnityState();
-                    system.RunUpdateRollbackInterpolation(tickDelta, false);
-                }
-            }
-            else
-            {
-                for (var systemIdx = 0; systemIdx < _systemsCount; systemIdx++)
-                    _systems[systemIdx].GetLatestUnityState();
+                var system = _systems[systemIdx];
+                system.GetLatestUnityState();
+                system.RunUpdateRollbackInterpolation(tickDelta, false);
             }
         }
 
@@ -778,7 +882,7 @@ namespace PurrNet.Prediction
                 }
 
                 for (var i = 0; i < _systemsCount; i++)
-                    _systems[i].WriteInput(localTick, player, frame, _deltaModuleState, isReliable);
+                    _systems[i].RunWriteInput(localTick, player, frame, _deltaModuleState, isReliable);
             }
         }
 
@@ -967,7 +1071,7 @@ namespace PurrNet.Prediction
             }
 
             for (var i = 0; i < count; ++i)
-                _systems[i].ReadInput(inputTick, default, frame, _deltaModuleState, isReliable);
+                _systems[i].RunReadInput(inputTick, default, frame, _deltaModuleState, isReliable);
 
             for (var i = 0; i < count; ++i)
             {
@@ -1044,6 +1148,11 @@ namespace PurrNet.Prediction
                 }
 
                 RollbackToFrame(previousFrame.packer, inPlaceTick, verifiedTick);
+
+                for (var j = 0; j < _firesObserverSimAtVerifiedArrival.Count; j++)
+                    _firesObserverSimAtVerifiedArrival[j].RunObserverSimulateTick(
+                        verifiedTick + 1, tickDelta, verifiedTick, isVerifiedArrival: true);
+
                 SimulateFrame(verifiedTick, true);
                 isVerified = false;
             }
@@ -1084,15 +1193,15 @@ namespace PurrNet.Prediction
 
             using (SimulateInputsMarker.Auto())
             {
-                for (var i = 0; i < _systemsCount; i++)
-                    _systems[i].OnPrepareSimulationInputs(verifiedTick, delta);
+                for (var i = 0; i < _firesInputSimAtVerifiedPass.Count; i++)
+                    _firesInputSimAtVerifiedPass[i].OnPrepareSimulationInputs(verifiedTick, delta);
             }
 
             var simulateMarker = SimulateMarker.Auto();
             try
             {
-                for (var j = 0; j < _systemsCount; j++)
-                    _systems[j].RunSimulateTick(verifiedTick, delta);
+                for (var j = 0; j < _firesInputSimAtVerifiedPass.Count; j++)
+                    _firesInputSimAtVerifiedPass[j].RunSimulateTick(verifiedTick, delta);
             }
             catch (Exception e)
             {
@@ -1108,8 +1217,8 @@ namespace PurrNet.Prediction
             var lateSimulateMarker = LateSimulateMarker.Auto();
             try
             {
-                for (var j = 0; j < _systemsCount; j++)
-                    _systems[j].RunLateSimulateTick(delta);
+                for (var j = 0; j < _firesInputSimAtVerifiedPass.Count; j++)
+                    _firesInputSimAtVerifiedPass[j].RunLateSimulateTick(delta);
             }
             catch (Exception e)
             {
@@ -1120,10 +1229,10 @@ namespace PurrNet.Prediction
                 lateSimulateMarker.Dispose();
             }
 
-            for (var i = 0; i < _systemsCount; i++)
-                _systems[i].PostSimulate();
-            for (var j = 0; j < _systemsCount; j++)
-                _systems[j].GetLatestUnityState();
+            for (var i = 0; i < _firesInputSimAtVerifiedPass.Count; i++)
+                _firesInputSimAtVerifiedPass[i].PostSimulate();
+            for (var j = 0; j < _firesInputSimAtVerifiedPass.Count; j++)
+                _firesInputSimAtVerifiedPass[j].GetLatestUnityState();
 
             isSimulating = false;
             localTickInContext = localTick;
@@ -1140,15 +1249,15 @@ namespace PurrNet.Prediction
 
             using (SimulateInputsMarker.Auto())
             {
-                for (var i = 0; i < _systemsCount; i++)
-                    _systems[i].OnPrepareSimulationInputs(inputTick, delta);
+                for (var i = 0; i < _firesInputSimAtVerifiedPass.Count; i++)
+                    _firesInputSimAtVerifiedPass[i].OnPrepareSimulationInputs(inputTick, delta);
             }
 
             var simulateMarker = SimulateMarker.Auto();
             try
             {
-                for (var j = 0; j < _systemsCount; j++)
-                    _systems[j].RunSimulateTick(stateTick, delta);
+                for (var j = 0; j < _firesInputSimAtVerifiedPass.Count; j++)
+                    _firesInputSimAtVerifiedPass[j].RunSimulateTick(stateTick, delta);
             }
             catch (Exception e)
             {
@@ -1164,8 +1273,8 @@ namespace PurrNet.Prediction
             var lateSimulateMarker = LateSimulateMarker.Auto();
             try
             {
-                for (var j = 0; j < _systemsCount; j++)
-                    _systems[j].RunLateSimulateTick(delta);
+                for (var j = 0; j < _firesInputSimAtVerifiedPass.Count; j++)
+                    _firesInputSimAtVerifiedPass[j].RunLateSimulateTick(delta);
             }
             catch (Exception e)
             {
@@ -1176,11 +1285,11 @@ namespace PurrNet.Prediction
                 lateSimulateMarker.Dispose();
             }
 
-            for (var i = 0; i < _systemsCount; i++)
-                _systems[i].PostSimulate();
+            for (var i = 0; i < _firesInputSimAtVerifiedPass.Count; i++)
+                _firesInputSimAtVerifiedPass[i].PostSimulate();
 
-            for (var j = 0; j < _systemsCount; j++)
-                _systems[j].GetLatestUnityState();
+            for (var j = 0; j < _firesInputSimAtVerifiedPass.Count; j++)
+                _firesInputSimAtVerifiedPass[j].GetLatestUnityState();
 
             isSimulating = false;
             localTickInContext = localTick;
@@ -1194,14 +1303,15 @@ namespace PurrNet.Prediction
 
             isSimulating = true;
             localTickInContext = verifiedTick;
+            ulong lastAuthoritativeTick = saveState ? verifiedTick : _lastVerifiedTick;
 
             if (saveState)
             {
                 using (SaveHistoryMarker.Auto())
                 {
-                    for (var i = 0; i < _systemsCount; i++)
+                    for (var i = 0; i < _firesInputSimAtVerifiedPass.Count; i++)
                     {
-                        var system = _systems[i];
+                        var system = _firesInputSimAtVerifiedPass[i];
                         if (!system.isEventHandler)
                             system.RunSaveState(verifiedTick);
                     }
@@ -1210,15 +1320,26 @@ namespace PurrNet.Prediction
 
             using (SimulateInputsMarker.Auto())
             {
-                for (var i = 0; i < _systemsCount; i++)
-                    _systems[i].OnPrepareSimulationInputs(verifiedTick, delta);
+                for (var i = 0; i < _firesInputSimAtVerifiedPass.Count; i++)
+                    _firesInputSimAtVerifiedPass[i].OnPrepareSimulationInputs(verifiedTick, delta);
             }
 
             var simulateMarker = SimulateMarker.Auto();
             try
             {
-                for (var j = 0; j < _systemsCount; j++)
-                    _systems[j].RunSimulateTick(verifiedTick, delta);
+                if (saveState)
+                {
+                    for (var j = 0; j < _firesInputSimAtVerifiedPass.Count; j++)
+                        _firesInputSimAtVerifiedPass[j].RunSimulateTick(verifiedTick, delta);
+                }
+                else
+                {
+                    for (var j = 0; j < _firesInputSimAtForwardReplay.Count; j++)
+                        _firesInputSimAtForwardReplay[j].RunSimulateTick(verifiedTick, delta);
+                    for (var j = 0; j < _firesObserverSimAtForwardReplay.Count; j++)
+                        _firesObserverSimAtForwardReplay[j].RunObserverSimulateTick(
+                            verifiedTick, delta, lastAuthoritativeTick, isVerifiedArrival: false);
+                }
             }
             catch (Exception e)
             {
@@ -1234,8 +1355,8 @@ namespace PurrNet.Prediction
             var lateSimulateMarker = LateSimulateMarker.Auto();
             try
             {
-                for (var j = 0; j < _systemsCount; j++)
-                    _systems[j].RunLateSimulateTick(delta);
+                for (var j = 0; j < _firesInputSimAtVerifiedPass.Count; j++)
+                    _firesInputSimAtVerifiedPass[j].RunLateSimulateTick(delta);
             }
             catch (Exception e)
             {
@@ -1250,20 +1371,20 @@ namespace PurrNet.Prediction
             {
                 using (SaveHistoryMarker.Auto())
                 {
-                    for (var i = 0; i < _systemsCount; i++)
+                    for (var i = 0; i < _firesInputSimAtVerifiedPass.Count; i++)
                     {
-                        var system = _systems[i];
+                        var system = _firesInputSimAtVerifiedPass[i];
                         if (system.isEventHandler)
                             system.RunSaveState(verifiedTick);
                     }
                 }
             }
 
-            for (var i = 0; i < _systemsCount; i++)
-                _systems[i].PostSimulate();
+            for (var i = 0; i < _firesInputSimAtVerifiedPass.Count; i++)
+                _firesInputSimAtVerifiedPass[i].PostSimulate();
 
-            for (var j = 0; j < _systemsCount; j++)
-                _systems[j].GetLatestUnityState();
+            for (var j = 0; j < _firesInputSimAtVerifiedPass.Count; j++)
+                _firesInputSimAtVerifiedPass[j].GetLatestUnityState();
 
             isSimulating = false;
             localTickInContext = localTick;
@@ -1342,7 +1463,7 @@ namespace PurrNet.Prediction
 
                     if (_instanceMap.TryGetValue(pid, out var system) && system.IsOwner(sender, senderIsServer))
                     {
-                        system.QueueInput(inputPacket, sender, _deltaModuleState, false);
+                        system.RunQueueInput(inputPacket, sender, _deltaModuleState, false);
                     }
                     else break;
                 }
@@ -1358,7 +1479,7 @@ namespace PurrNet.Prediction
             if (_updateViewMode != UpdateViewMode.Update)
                 return;
 
-            if (!isClient)
+            if (!isClient && !isServer)
                 return;
 
             UpdateView();
@@ -1369,7 +1490,7 @@ namespace PurrNet.Prediction
             if (_updateViewMode != UpdateViewMode.LateUpdate)
                 return;
 
-            if (!isClient)
+            if (!isClient && !isServer)
                 return;
 
             UpdateView();
@@ -1565,5 +1686,28 @@ namespace PurrNet.Prediction
             pid = default;
             return false;
         }
+    }
+
+    internal static class SimulateRoleExtensions
+    {
+        public static bool FiresInputSimAtVerifiedPass(this PredictionManager.SimulateRole r)
+            => r is PredictionManager.SimulateRole.ControllerAuthority
+                  or PredictionManager.SimulateRole.ObserverInputSimForward
+                  or PredictionManager.SimulateRole.ObserverInputVerifiedOnly
+                  or PredictionManager.SimulateRole.ObserverInputVerifiedStateExtrapolate
+                  or PredictionManager.SimulateRole.ObserverStateForward;
+
+        public static bool FiresInputSimAtForwardReplay(this PredictionManager.SimulateRole r)
+            => r is PredictionManager.SimulateRole.ControllerAuthority
+                  or PredictionManager.SimulateRole.ObserverInputSimForward
+                  or PredictionManager.SimulateRole.ObserverStateForward;
+
+        public static bool FiresObserverSimAtVerifiedArrival(this PredictionManager.SimulateRole r)
+            => r is PredictionManager.SimulateRole.ObserverStateVerifiedOnly
+                  or PredictionManager.SimulateRole.ObserverStateVerifiedExtrapolate;
+
+        public static bool FiresObserverSimAtForwardReplay(this PredictionManager.SimulateRole r)
+            => r is PredictionManager.SimulateRole.ObserverInputVerifiedStateExtrapolate
+                  or PredictionManager.SimulateRole.ObserverStateVerifiedExtrapolate;
     }
 }

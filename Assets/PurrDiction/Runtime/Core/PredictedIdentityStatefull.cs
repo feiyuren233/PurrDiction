@@ -11,6 +11,47 @@ namespace PurrNet.Prediction
 {
     public abstract class PredictedIdentity<STATE> : PredictedIdentity where STATE : struct, IPredictedData<STATE>
     {
+        [SerializeField, Range(0, 30), Tooltip(
+            "Ticks to render behind the latest received state on observers. " +
+            "Higher = more jitter tolerance, more visible lag. " +
+            "Default 1 tick. 0 = auto (tickRate/10, minimum 2 ticks; ~100 ms at 60 Hz).")]
+        private int _interpolationDelayTicks = 1;
+
+        public int interpolationDelayTicks => _interpolationDelayTicks;
+
+        [SerializeField, Tooltip(
+            "Controls whether the framework propagates state forward via the observer Simulate(ref state) hook.\n\n" +
+            "When TRUE (default) — full extrapolation:\n" +
+            "  - Mode C observers: hook fires at verified arrival AND per forward-replay tick.\n" +
+            "  - Mode B observers: hook fires per forward-replay tick.\n\n" +
+            "When FALSE — notification-only:\n" +
+            "  - Mode C observers: hook STILL FIRES at verified arrival, but no forward-replay calls.\n" +
+            "  - Mode B observers: hook is not called at all. State held at verified-tick value.\n\n" +
+            "Has no effect on Mode A identities (input-Simulate covers every tick).")]
+        private bool _extrapolateState = true;
+
+        public override bool extrapolateState
+        {
+            get => _extrapolateState;
+            set
+            {
+                if (_extrapolateState == value) return;
+                _extrapolateState = value;
+                predictionManager?.RecomputeRoleFor(this);
+            }
+        }
+
+        [SerializeField, Range(0, 30), Tooltip(
+            "Maximum number of ticks the observer Simulate(ref state) hook will be called forward from the last " +
+            "authoritative state during forward-replay before the framework stops calling it and lets the state hold.")]
+        private int _maxStateExtrapolationTicks = 1;
+
+        public int maxStateExtrapolationTicks
+        {
+            get => _maxStateExtrapolationTicks;
+            set => _maxStateExtrapolationTicks = value;
+        }
+
         public PredictedHierarchy hierarchy { get; private set; }
 
         public override string ToString()
@@ -88,8 +129,9 @@ namespace PurrNet.Prediction
             ResetStateToInitialState();
             GetLatestUnityState();
 
-            // if TickRate is 30, then this should be 2
-            var interpolationBuffer = (int)Mathf.Max(world.tickRate / (float)10, 2);
+            var interpolationBuffer = _interpolationDelayTicks > 0
+                ? _interpolationDelayTicks
+                : (int)Mathf.Max(world.tickRate / (float)10, 2);
 
             if (_interpolatedState == null)
             {
@@ -348,6 +390,31 @@ namespace PurrNet.Prediction
         protected virtual void LateUpdateView(STATE viewState, STATE? verified) {}
 
         protected virtual void ViewStart(STATE viewState, STATE? verified) {}
+
+        internal override void RunObserverSimulateTick(ulong tick, float delta, ulong lastAuthoritativeTick, bool isVerifiedArrival)
+        {
+            if (isVerifiedArrival)
+            {
+                Simulate(ref fullPredictedState.state, delta);
+                if (_extrapolateState)
+                    _stateHistory.Write(tick, fullPredictedState.DeepCopy());
+                return;
+            }
+
+            var budget = _maxStateExtrapolationTicks > 0
+                ? _maxStateExtrapolationTicks
+                : Mathf.CeilToInt(0.8f * 10f / (delta * 60f));
+
+            var distance = (long)tick - (long)lastAuthoritativeTick;
+            if (distance > budget)
+            {
+                _stateHistory.Write(tick, fullPredictedState.DeepCopy());
+                return;
+            }
+
+            Simulate(ref fullPredictedState.state, delta);
+            _stateHistory.Write(tick, fullPredictedState.DeepCopy());
+        }
 
         protected virtual void UpdateView(STATE viewState, STATE? verified) {}
 

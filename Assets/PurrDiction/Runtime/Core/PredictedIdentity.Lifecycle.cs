@@ -91,5 +91,34 @@ namespace PurrNet.Prediction
             ClearFutureModules(tick);
             ClearFuture(tick);
         }
+
+        internal void RunWriteInput(ulong localTick, PlayerID receiver, BitPacker input, DeltaModule deltaModule, bool reliable)
+        {
+            if (receiver != default(PlayerID) && !forwardInput) return;
+            WriteInput(localTick, receiver, input, deltaModule, reliable);
+        }
+
+        internal void RunReadInput(ulong tick, PlayerID sender, BitPacker packer, DeltaModule deltaModule, bool reliable)
+        {
+            if (!forwardInput) return;
+            ReadInput(tick, sender, packer, deltaModule, reliable);
+        }
+
+        internal void RunWriteFirstInput(ulong localTick, BitPacker packer)
+        {
+            if (!forwardInput) return;
+            WriteFirstInput(localTick, packer);
+        }
+
+        internal void RunReadFirstInput(ulong localTick, BitPacker packer)
+        {
+            if (!forwardInput) return;
+            ReadFirstInput(localTick, packer);
+        }
+
+        internal void RunQueueInput(BitPacker packer, PlayerID sender, DeltaModule deltaModule, bool reliable)
+        {
+            QueueInput(packer, sender, deltaModule, reliable);
+        }
     }
 }
