@@ -299,6 +299,11 @@ namespace PurrNet.Prediction
                 packer.Dispose();
             _clientFrames.Clear();
 
+            for (var i = 0; i < _fragmentPackersInFlight.Count; i++)
+                _fragmentPackersInFlight[i].Dispose();
+            _fragmentPackersInFlight.Clear();
+            _fragments.Clear();
+
             if (_tickManager != null)
             {
                 _tickManager.onPreTick -= OnPreTick;
@@ -329,11 +334,19 @@ namespace PurrNet.Prediction
             _systemsCount = 0;
             _nextSystemId = 0;
             _clientTicks.Clear();
+
+            foreach (var packer in _clientFrames)
+                packer.Dispose();
             _clientFrames.Clear();
+
+            for (var i = 0; i < _fragmentPackersInFlight.Count; i++)
+                _fragmentPackersInFlight[i].Dispose();
+            _fragmentPackersInFlight.Clear();
+
             localTick = 1;
             _lastVerifiedTick = 1;
             localTickInContext = 1;
-            _deltas.Clear();
+            _fragments.Clear();
         }
 
         private uint _nextSystemId = 0;
@@ -509,7 +522,8 @@ namespace PurrNet.Prediction
                 _clientFrames.Add(new PlayerPacker
                 {
                     player = player,
-                    packer = BitPackerPool.Get()
+                    packer = BitPackerPool.Get(),
+                    boundaries = new List<int>(256)
                 });
 
                 using var frame = BitPackerPool.Get();
@@ -591,6 +605,20 @@ namespace PurrNet.Prediction
 
         readonly List<PlayerPacker> _clientFrames = new (16);
 
+        // Ids decoded this consume — so the full-rollback pass rolls each identity back exactly once.
+        readonly HashSet<PredictedComponentID> _presentIds = new();
+
+        // Fragment packers handed to the unreliable RPC during this server tick. Their bytes must outlive the RPC
+        // call until the network flush, so they are freed at the START of the next server tick (ResetAllPackers) —
+        // the same lifetime discipline as the reused per-player staging packers (_clientFrames). Server-only.
+        readonly List<BitPacker> _fragmentPackersInFlight = new(16);
+
+        // Conservative wire headroom subtracted from the unreliable MTU before packing entries into a fragment:
+        // RPC batch/union header (RPCBatch.MAX_HEADER_SIZE) plus our RPC params (player, echoTick, entryCount) and
+        // the BitPackerWithLength byte-length prefix. Mirrors NetworkBones' (RPCBatch.MAX_HEADER_SIZE + params)
+        // budget; 64 is a safe floor above that sum (budget is computed against uncompressed bytes).
+        const int FRAGMENT_HEADROOM_BYTES = 64;
+
         public bool cachedIsServer { get; private set; }
 
         private void OnPreTick()
@@ -631,12 +659,15 @@ namespace PurrNet.Prediction
 
             if (cachedIsServer)
             {
+                // Pre-sim: write the non-event-handler entries while their live state is the start-of-tick state
+                // (matching their pre-sim RunSaveState above). Resets the per-player packers for this tick.
                 using (WriteFrameOnServerMarker.Auto())
                 {
                     if (_pendingFullSync.Count > 0)
                         FlushPendingFullSyncs();
                     ResetAllPackers();
-                    WriteInitialFrameToOthers();
+                    for (var j = 0; j < _clientFrames.Count; j++)
+                        WriteFrameEntries(_clientFrames[j].player, _clientFrames[j].packer, _clientFrames[j].boundaries, eventHandlers: false);
                 }
             }
 
@@ -699,7 +730,10 @@ namespace PurrNet.Prediction
                 {
                     for (var i = 0; i < _systemsCount; i++)
                         _systems[i].lastVerifiedTick = localTick;
-                    WriteEventHandles();
+                    // Post-sim: append the event-handler entries (their live state is now end-of-tick, matching
+                    // their post-sim RunSaveState), then send. Packers were already reset in the pre-sim write block.
+                    for (var j = 0; j < _clientFrames.Count; j++)
+                        WriteFrameEntries(_clientFrames[j].player, _clientFrames[j].packer, _clientFrames[j].boundaries, eventHandlers: true);
                     SendFrameToOthers();
                 }
             }
@@ -784,84 +818,143 @@ namespace PurrNet.Prediction
 
         private void ResetAllPackers()
         {
+            // Free last tick's fragment packers now that the network has flushed them.
+            for (var i = 0; i < _fragmentPackersInFlight.Count; i++)
+                _fragmentPackersInFlight[i].Dispose();
+            _fragmentPackersInFlight.Clear();
+
             for (var i = 0; i < _clientFrames.Count; i++)
             {
                 var packer = _clientFrames[i];
                 packer.packer.ResetPositionAndMode(false);
+                packer.boundaries.Clear();
+                packer.boundaries.Add(0); // start of entry 0 (packer position is 0 after reset)
             }
         }
 
-        private void WriteInitialFrameToOthers()
+        // Writes [ (PredictedComponentID id, payload) ] for one group into `player`'s `frame`, appending one bit
+        // boundary per entry to `boundaries`. After both write phases boundaries.Count - 1 == the total entry count
+        // (boundaries is seeded with [0] in ResetAllPackers) — the single source of truth used by both the reliable
+        // send and the fragment slicer. payload = WriteCurrentState bits, then WriteInput bits.
+        //
+        // Skips isDeterministic systems (client-reconstructed — they roll back from local history) UNLESS determinism
+        // validation is on, in which case their state is written so the client can compare it against its prediction.
+        // Note: when frameChannelMode==Unreliable && syncDeterministicData, isDeterministic is false (syncData==true),
+        // so those systems ARE written and delta-packed normally. Deterministic WriteInput is a no-op, so skipping a
+        // deterministic system never drops input.
+        //
+        // The non-event-handler group is written PRE-simulation and the event-handler group POST-simulation, to match
+        // each group's RunSaveState phase (non-event-handlers save start-of-tick state pre-sim; event-handlers save
+        // end-of-tick state post-sim). Writing both post-sim would put start-of-tick systems on the wire as their
+        // end-of-tick state, shifting the client's tick by one. The split is load-bearing for tick alignment.
+        private void WriteFrameEntries(PlayerID player, BitPacker frame, List<int> boundaries, bool eventHandlers)
         {
-            var fCount = _clientFrames.Count;
-
-            for (var j = 0; j < fCount; j++)
-            {
-                var frame = _clientFrames[j].packer;
-                var player = _clientFrames[j].player;
-
-                Packer<PackedInt>.Write(frame, _systemsCount);
-
-                for (var i = 0; i < _systemsCount; i++)
-                {
-                    if (_systems[i].isEventHandler)
-                        continue;
-
-                    _systems[i].RunWriteCurrentState(player, frame, _deltaModuleState, isReliable);
-                }
-
-                for (var i = 0; i < _systemsCount; i++)
-                    _systems[i].WriteInput(localTick, player, frame, _deltaModuleState, isReliable);
-            }
-        }
-
-        private void WriteEventHandles()
-        {
-            var fCount = _clientFrames.Count;
-
             for (var i = 0; i < _systemsCount; i++)
             {
-                if (!_systems[i].isEventHandler)
+                var system = _systems[i];
+                if (system.isEventHandler != eventHandlers)
+                    continue;
+                if (system.isDeterministic && !_validateDeterministicData)
                     continue;
 
-                var system = _systems[i];
+                Packer<PredictedComponentID>.Write(frame, system.id);
+                system.RunWriteCurrentState(player, frame, _deltaModuleState, isReliable);
+                system.WriteInput(localTick, player, frame, _deltaModuleState, isReliable);
 
-                for (var j = 0; j < fCount; j++)
-                {
-                    var frame = _clientFrames[j];
-                    var packer = frame.packer;
-                    system.RunWriteCurrentState(frame.player, packer, _deltaModuleState, isReliable);
-                }
+                boundaries.Add(frame.positionInBits); // end of this entry / start of next
             }
         }
 
         private void SendFrameToOthers()
         {
             var fCount = _clientFrames.Count;
-
             for (var j = 0; j < fCount; j++)
             {
                 var player = _clientFrames[j].player;
                 var packer = _clientFrames[j].packer;
-                var deltaLen = packer.ToByteData().length;
+                var boundaries = _clientFrames[j].boundaries;
 
-                if (!_clientTicks.TryGetValue(player, out var queue))
-                {
-                    SendFrameToRemote(player, 0, new BitPackerWithLength(deltaLen, packer));
-                    continue;
-                }
-
-                ulong tick = 0;
-
-                if (queue.Count > 0 && !queue.waitForInput)
+                ulong echoTick = 0;
+                if (_clientTicks.TryGetValue(player, out var queue) && queue.Count > 0 && !queue.waitForInput)
                 {
                     var dequeued = queue.inputQueue.Dequeue();
-                    tick = dequeued.clientTick;
+                    echoTick = dequeued.clientTick;
                     dequeued.inputPacket.Dispose();
                 }
 
-                SendFrameToRemote(player, tick, new BitPackerWithLength(deltaLen, packer));
+                if (isReliable)
+                {
+                    // ReliableOrdered is transport-fragmented; send the whole frame as one RPC. boundaries.Count - 1
+                    // is the entry count (seeded with [0], one element appended per written entry across both phases).
+                    uint entryCount = (uint)(boundaries.Count - 1);
+                    SendFrameToRemoteReliable(player, echoTick, entryCount, new BitPackerWithLength(packer.ToByteData().length, packer));
+                }
+                else
+                {
+                    // Plain Unreliable is MTU-bounded; split into independently-applied fragments.
+                    SendFragments(player, packer, boundaries, echoTick);
+                }
             }
+        }
+
+        // Greedily packs ascending-id entries from `source` into MTU-sized fragments, one unreliable RPC each.
+        // Each fragment is a self-contained [ (id, payload) ]×count mini-frame applied independently on the client.
+        private void SendFragments(PlayerID player, BitPacker source, List<int> boundaries, ulong echoTick)
+        {
+            int entries = boundaries.Count - 1;
+            if (entries <= 0) { SendOneFragment(player, echoTick, 0, BitPackerPool.Get()); return; } // empty keepalive (advances the tick)
+
+            // GetMTU returns BYTES for the unreliable channel. The frame sender is the server → asServer = cachedIsServer.
+            // Loopback/local connections (host self-send, LocalTransport / PurrTransportLayer loopback) report int.MaxValue,
+            // and (int.MaxValue - 64) * 8 overflows int32 to a NEGATIVE budget (-520) — every entry then looks "oversized",
+            // spamming the error and force-sending each identity as its own fragment. Do the * 8 in long and clamp to
+            // int.MaxValue: real MTUs are unchanged, loopback gets an effectively unbounded budget (whole frame → one fragment).
+            int mtuBytes = networkManager.GetMTU(player, Channel.Unreliable, cachedIsServer);
+            int budgetBits = (int)Math.Min((long)Math.Max(256, mtuBytes - FRAGMENT_HEADROOM_BYTES) * 8, int.MaxValue);
+
+            var frag = BitPackerPool.Get();
+            int fragStartEntry = 0;
+
+            for (int k = 0; k < entries; k++)
+            {
+                int entryBits = boundaries[k + 1] - boundaries[k];
+
+                // One entry larger than the budget cannot be sub-fragmented. Isolate it in its OWN fragment (flush
+                // whatever precedes it first) and log: the transport will drop this over-MTU fragment, so that identity
+                // holds and recovers via the ack-gated re-send. NEVER blit a partial entry, and never let an oversized
+                // entry corrupt the alignment of others.
+                if (entryBits > budgetBits)
+                {
+                    Debug.LogError($"[Fragment] entry {k} = {entryBits} bits > budget {budgetBits}; per-identity sub-fragmentation not implemented. This entry's fragment will be dropped by the transport until it shrinks.", this);
+                    if (frag.positionInBits > 0) { SendOneFragment(player, echoTick, (uint)(k - fragStartEntry), frag); frag = BitPackerPool.Get(); }
+                    var bigSlice = new BitData(source, boundaries[k], entryBits);
+                    frag.WriteBitDataWithoutConsumingIt(bigSlice);
+                    SendOneFragment(player, echoTick, 1, frag);
+                    frag = BitPackerPool.Get();
+                    fragStartEntry = k + 1;
+                    continue;
+                }
+
+                if (frag.positionInBits > 0 && frag.positionInBits + entryBits > budgetBits)
+                {
+                    SendOneFragment(player, echoTick, (uint)(k - fragStartEntry), frag);
+                    frag = BitPackerPool.Get();
+                    fragStartEntry = k;
+                }
+
+                var slice = new BitData(source, boundaries[k], entryBits);
+                frag.WriteBitDataWithoutConsumingIt(slice); // copies bits; does not move source's cursor
+            }
+
+            if (frag.positionInBits > 0) SendOneFragment(player, echoTick, (uint)(entries - fragStartEntry), frag);
+            else frag.Dispose();
+        }
+
+        // Sends one fragment and registers its packer for end-of-tick disposal (its bytes must live until the flush).
+        private void SendOneFragment(PlayerID player, ulong echoTick, uint entryCount, BitPacker frag)
+        {
+            SendFrameToRemoteUnreliable(player, echoTick, entryCount, new BitPackerWithLength(frag.ToByteData().length, frag));
+            _fragmentPackersInFlight.Add(frag);
         }
 
         /// <summary>
@@ -999,45 +1092,49 @@ namespace PurrNet.Prediction
             }
         }
 
-        struct FrameDelta : IDisposable
-        {
-            public BitPacker packer;
-            public ulong clientTick;
-
-            public void Dispose()
-            {
-                packer?.Dispose();
-            }
-        }
-
-        readonly Queue<FrameDelta> _deltas = new ();
-
-        private void SendFrameToRemote(PlayerID player, ulong localTick, BitPackerWithLength delta)
-        {
-            if (isReliable) SendFrameToRemoteReliable(player, localTick, delta);
-            else            SendFrameToRemoteUnreliable(player, localTick, delta);
-        }
+        // Arrived fragments grouped by serverEchoTick, decoded at consume (replaces the single-packet _deltas queue).
+        readonly FragmentBuffer _fragments = new();
 
         [TargetRpc(compressionLevel: CompressionLevel.Best, channel: Channel.ReliableOrdered)]
-        private void SendFrameToRemoteReliable([UsedImplicitly] PlayerID player, ulong localTick, BitPackerWithLength delta)
+        private void SendFrameToRemoteReliable([UsedImplicitly] PlayerID player, ulong echoTick, uint entryCount, BitPackerWithLength delta)
         {
             delta.packer.SkipBytes(delta.originalLength);
-            _deltas.Enqueue(new FrameDelta
-            {
-                packer = delta.packer,
-                clientTick = localTick
-            });
+            IngestFragment(echoTick, entryCount, delta.packer);
         }
 
-        [TargetRpc(compressionLevel: CompressionLevel.Best, channel: Channel.UnreliableSequenced)]
-        private void SendFrameToRemoteUnreliable([UsedImplicitly] PlayerID player, ulong localTick, BitPackerWithLength delta)
+        // CompressionLevel.Best (matches the reliable RPC). Compression in PreProcessRpc (RPCModule) runs BEFORE
+        // batching/MTU-check, so the transport sees the COMPRESSED size, which is <= our uncompressed SendFragments
+        // budget < MTU. compressionLevel is also a compile-time-SYMMETRIC decision (PostProcessRpc decompresses iff
+        // level != None), so both peers must agree — keeping Best matches the reliable path and avoids a mismatch.
+        [TargetRpc(compressionLevel: CompressionLevel.Best, channel: Channel.Unreliable)]
+        private void SendFrameToRemoteUnreliable([UsedImplicitly] PlayerID player, ulong echoTick, uint entryCount, BitPackerWithLength delta)
         {
             delta.packer.SkipBytes(delta.originalLength);
-            _deltas.Enqueue(new FrameDelta
+            IngestFragment(echoTick, entryCount, delta.packer);
+        }
+
+        // Buffers one arrived fragment under its serverEchoTick. Both channels funnel through here so the consume
+        // path is unified (reliable = one whole-frame "fragment"; unreliable = several). Peeks the first id so the
+        // buffer can order fragments hierarchy-first. Decode happens later, at consume (OnPostTick) — never here.
+        private void IngestFragment(ulong echoTick, uint entryCount, BitPacker packer)
+        {
+            // Stale-fragment discard: plain Unreliable can reorder, so a late fragment for an already-verified tick
+            // must not regress state. echoTick<=1 is the in-place sentinel (see OnPostTick), never stale.
+            if (echoTick > 1 && echoTick <= _lastVerifiedTick)
             {
-                packer = delta.packer,
-                clientTick = localTick
-            });
+                packer.Dispose();
+                return;
+            }
+
+            PredictedComponentID firstId = default;
+            if (entryCount > 0)
+            {
+                packer.ResetPositionAndMode(true);
+                Packer<PredictedComponentID>.Read(packer, ref firstId);
+                packer.ResetPositionAndMode(true); // rewind for the real decode at consume
+            }
+
+            _fragments.Add(echoTick, new ArrivedFragment { packer = packer, entryCount = entryCount, firstId = firstId });
         }
 
         private void RollbackToFrame(ulong stateTick)
@@ -1047,41 +1144,90 @@ namespace PurrNet.Prediction
             SyncTransforms();
         }
 
-        private void RollbackToFrame(BitPacker frame, ulong stateTick, ulong inputTick)
+        // Decodes entryCount (id, payload) entries from `frame` in ascending id order. State read at stateTick,
+        // input at inputTick (matching the old RollbackToFrame param split). Rolls each present identity back so the
+        // hierarchy (lowest id) spawns before dependents resolve. Records present ids. Aborts the rest on an
+        // unconfirmed id (id absent from _instanceMap == not server-confirmed; no length prefix means we cannot skip it).
+        private void ReadFrameEntries(BitPacker frame, uint entryCount, ulong stateTick, ulong inputTick)
         {
-            frame.ResetPositionAndMode(true);
-
-            PackedInt _count = default;
-            Packer<PackedInt>.Read(frame, ref _count);
-            int count = _count;
-
-            for (var i = 0; i < count; ++i)
+            for (uint e = 0; e < entryCount; e++)
             {
-                var system = _systems[i];
-                if (system.isEventHandler)
-                    continue;
+                PredictedComponentID id = default;
+                Packer<PredictedComponentID>.Read(frame, ref id);
+
+                if (!_instanceMap.TryGetValue(id, out var system))
+                    return; // unconfirmed/lost-spawn id — cannot size the remaining payloads; stop.
+
                 if (_validateDeterministicData && system.isDeterministic)
                     system.RunRollback(stateTick);
                 system.RunClearFuture(stateTick);
                 system.RunReadState(stateTick, frame, _deltaModuleState, isReliable);
                 system.RunRollback(stateTick);
                 system.lastVerifiedTick = stateTick;
+                _presentIds.Add(id);
+
+                system.ReadInput(inputTick, default, frame, _deltaModuleState, isReliable);
             }
+        }
 
-            for (var i = 0; i < count; ++i)
-                _systems[i].ReadInput(inputTick, default, frame, _deltaModuleState, isReliable);
+        // Decodes one tick's buffered fragments (ascending by firstId → global ascending id order, hierarchy first),
+        // then rolls every absent identity to stateTick from history. Present identities were already rolled back
+        // during decode, so they are skipped — keeping exactly one rollback per identity per tick.
+        //
+        // HIERARCHY-GATED DECODE. Per-entry decode self-aligns only when the spawn/hierarchy set the entries were
+        // written against matches the client's. The hierarchy entry (globally lowest id, decoded first) carries the
+        // spawn/despawn/reparent for this tick. On the unreliable path the hierarchy rides its own fragment which can
+        // be DROPPED while a higher-id fragment survives; decoding that survivor against a stale hierarchy could apply
+        // state to an identity that should have despawned, or hit an id not yet in _instanceMap. So if the hierarchy
+        // entry did not arrive this tick we DECODE NOTHING and hold every identity at its last state (the design's
+        // hold-on-loss fallback); the dropped fragments recover next tick via the ack-gated re-send. Reliable mode
+        // always carries the whole frame as one hierarchy-first fragment, so this never trips there.
+        //
+        // TODO(wire-hierarchy-confirmation): holding the whole tick is conservative — it discards surviving fragments
+        // that would have decoded fine. A future wire format could carry a per-entry length prefix so a survivor can
+        // be skipped by size without needing the hierarchy, or the verified spawn-set delta on the wire.
+        private void ReadFragmentsIntoSystems(List<ArrivedFragment> group, ulong stateTick, ulong inputTick)
+        {
+            _presentIds.Clear();
 
-            for (var i = 0; i < count; ++i)
+            // Decode only if the hierarchy entry arrived this tick (it sorts to a fragment whose firstId == its id;
+            // a 0-entry keepalive may sort ahead of it, so scan rather than peek group[0]). If the hierarchy is not
+            // a registered system at all, we cannot gate — fall back to decoding as before.
+            bool hierarchyPresent = hierarchy == null;
+            if (!hierarchyPresent)
             {
-                var system = _systems[i];
-                if (!system.isEventHandler)
-                    continue;
-                system.RunClearFuture(stateTick);
-                system.RunReadState(stateTick, frame, _deltaModuleState, isReliable);
-                system.RunRollback(stateTick);
-                system.lastVerifiedTick = stateTick;
+                var hierarchyId = hierarchy.id;
+                for (int g = 0; g < group.Count; g++)
+                    if (group[g].entryCount > 0 && group[g].firstId.Equals(hierarchyId)) { hierarchyPresent = true; break; }
             }
 
+            if (hierarchyPresent)
+            {
+                for (int g = 0; g < group.Count; g++)
+                {
+                    var frag = group[g];
+                    frag.packer.ResetPositionAndMode(true);
+                    ReadFrameEntries(frag.packer, frag.entryCount, stateTick, inputTick);
+                }
+            }
+
+            // Absent identities (deterministic/client-reconstructed, a lost fragment, aborted past an unknown id, or —
+            // when the hierarchy fragment was lost — the entire tick) got no authoritative data this tick → roll to
+            // stateTick from history (ReadOrPrevious holds last state).
+            // TODO(extrapolation): a lost-fragment identity holds its last state here; revisit to extrapolate.
+            for (var i = 0; i < _systemsCount; i++)
+            {
+                var sys = _systems[i];
+                if (_presentIds.Contains(sys.id)) continue;
+                sys.RunRollback(stateTick);
+                // Deterministic systems are absent BY DESIGN (skipped on write, reconstructed from local history),
+                // so they are verified-by-reconstruction at stateTick — advance lastVerifiedTick to keep their
+                // view-layer `verifiedState` current, matching this repo's pre-fragmentation decode (which set it for
+                // every decoded system). A genuinely LOST-fragment (non-deterministic) system is intentionally NOT
+                // marked verified here — we received no authoritative data for it this tick.
+                if (sys.isDeterministic)
+                    sys.lastVerifiedTick = stateTick;
+            }
             SyncTransforms();
         }
 
@@ -1104,7 +1250,7 @@ namespace PurrNet.Prediction
 
         private void OnPostTick()
         {
-            if (cachedIsServer || _deltas.Count == 0 || localTick <= _lastVerifiedTick)
+            if (cachedIsServer || _fragments.TickCount == 0 || localTick <= _lastVerifiedTick)
             {
                 if (isClient)
                     UpdateInterpolation(false);
@@ -1118,14 +1264,17 @@ namespace PurrNet.Prediction
             isSimulating = true;
             isReplaying = true;
 
-            while (_deltas.Count > 0)
+            while (_fragments.TickCount > 0)
             {
+                if (!_fragments.TryPeekOldestTick(out var echoTick))
+                    break;
+                var group = _fragments.TakeTick(echoTick);
+
                 isVerified = true;
-                using var previousFrame = _deltas.Dequeue();
-                bool inPlace = previousFrame.clientTick <= 1;
+                bool inPlace = echoTick <= 1;
                 var lastTick = _lastVerifiedTick;
                 if (!inPlace)
-                    _lastVerifiedTick = previousFrame.clientTick;
+                    _lastVerifiedTick = echoTick;
 
                 ulong verifiedTick = _lastVerifiedTick;
                 bool isJump = verifiedTick - lastTick > 1;
@@ -1141,9 +1290,18 @@ namespace PurrNet.Prediction
                     isCatchingUpFrames = false;
                 }
 
-                RollbackToFrame(previousFrame.packer, inPlaceTick, verifiedTick);
-                SimulateFrame(verifiedTick, true);
-                isVerified = false;
+                try
+                {
+                    ReadFragmentsIntoSystems(group, inPlaceTick, verifiedTick);
+                    SimulateFrame(verifiedTick, true);
+                    isVerified = false;
+                }
+                finally
+                {
+                    for (int g = 0; g < group.Count; g++)
+                        group[g].Dispose();
+                    _fragments.Recycle(group);   // return the per-tick list to the pool (no per-tick GC)
+                }
             }
 
             SimulateFrame(_lastVerifiedTick + 1, true);
