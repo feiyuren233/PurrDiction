@@ -174,6 +174,7 @@ namespace PurrNet.Prediction
         {
             if (_history.ReadOrPrevious(tick, out var result))
             {
+                fullPredictedState.Dispose();
                 fullPredictedState = result.DeepCopy();
             }
         }
